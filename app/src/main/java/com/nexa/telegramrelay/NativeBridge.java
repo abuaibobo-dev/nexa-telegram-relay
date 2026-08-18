@@ -186,7 +186,7 @@ final class NativeBridge {
             }
             
             if (sourceIds.isEmpty()) {
-                callback("nexaDiscoverResult", "{"channels":[],"error":"没有来源频道，请先添加"}");
+                callback("nexaDiscoverResult", "{\"channels\":[],\"error\":\"没有来源频道，请先添加\"}");
                 return;
             }
             
@@ -237,7 +237,7 @@ final class NativeBridge {
                 });
             }
         } catch (Exception error) {
-            callback("nexaDiscoverResult", "{"channels":[],"error":"" + error.getMessage() + ""}");
+            callback("nexaDiscoverResult", "{\"channels\":[],\"error\":\"" + error.getMessage() + "\"}");
         }
     }
     private void executeRelayRule(String ruleJson) {
