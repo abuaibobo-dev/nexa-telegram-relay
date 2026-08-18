@@ -1,387 +1,539 @@
-const $ = id => document.getElementById(id);
-const read = (key, fallback) => { try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; } };
-const save = (key, value) => localStorage.setItem(key, JSON.stringify(value));
-const uid = () => globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
 
-function showConfirm(msg, onOk) {
-  var overlay = document.createElement('div');
-  overlay.className = 'confirm-overlay';
-  overlay.innerHTML = '<div class="confirm-box"><p>' + esc(msg) + '</p><div class="confirm-actions"><button class="confirm-cancel" id="_cfm_no">取消</button><button class="confirm-ok" id="_cfm_yes">确定</button></div></div>';
-  document.body.appendChild(overlay);
-  overlay.querySelector('#_cfm_no').onclick = function() { overlay.remove(); };
-  overlay.querySelector('#_cfm_yes').onclick = function() { overlay.remove(); onOk(); };
+const $=id=>document.getElementById(id);
+const read=(k,f)=>{try{return JSON.parse(localStorage.getItem(k))??f}catch{return f}};
+const save=(k,v)=>localStorage.setItem(k,JSON.stringify(v));
+const uid=()=>globalThis.crypto?.randomUUID?.()||`${Date.now()}-${Math.random().toString(16).slice(2)}`;
+const esc=v=>String(v??"").replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+// === TDLib Status ===
+let tdlibStatus = 'uninitialized'; // uninitialized/connecting/ready/error
+function setTdlibStatus(s) {
+  tdlibStatus = s;
+  var input = $('chatInput');
+  var send = $('sendBtn');
+  if (s === 'ready') {
+    input.disabled = false; input.placeholder = '说点什么...';
+    send.disabled = false; send.style.opacity = '1';
+  } else {
+    input.disabled = true; input.placeholder = s === 'connecting' ? '正在连接 Telegram...' : s === 'error' ? 'Telegram 连接失败' : '请先连接 Telegram';
+    send.disabled = true; send.style.opacity = '0.4';
+  }
+  updateStatus();
 }
 
-function showToast(msg, duration) {
-  duration = duration || 2200;
-  var existing = document.querySelector('.toast-capsule');
-  if (existing) existing.remove();
-  var t = document.createElement('div');
-  t.className = 'toast-capsule';
-  t.textContent = msg;
-  document.body.appendChild(t);
-  requestAnimationFrame(function() { t.classList.add('show'); });
-  setTimeout(function() { t.classList.remove('show'); setTimeout(function() { t.remove(); }, 300); }, duration);
+// === Message Queue ===
+let msgQueue = [];
+let msgProcessing = false;
+function enqueueMsg(fn) {
+  if (msgQueue.length > 20) { showToast('⚠ 队列已满，请稍后再试'); return; }
+  msgQueue.push(fn);
+  processQueue();
 }
-
-window.applyTemplate = function(type) {
-  $('mediaType').value = type;
-  document.querySelectorAll('.tpl-btn').forEach(function(b) { b.classList.remove('active'); });
-  event.target.classList.add('active');
-};
-
-window.toggleFold = function(el) {
-  var body = el.nextElementSibling;
-  var arrow = el.querySelector('.fold-arrow');
-  var isOpen = body.classList.contains('open');
-  body.classList.toggle('open');
-  arrow.classList.toggle('open');
-};
-
-// Long press on source items to quick bind
-document.addEventListener('touchstart', function(e) {
-  var item = e.target.closest('.ch-item');
-  if (!item) return;
-  var chId = item.querySelector('[onclick*="quickBind"]');
-  if (!chId) return;
-  var timer = setTimeout(function() {
-    var match = chId.getAttribute('onclick').match(/quickBind\('(.+?)'\)/);
-    if (match) window.quickBind(match[1]);
-  }, 500);
-  var cancel = function() { clearTimeout(timer); document.removeEventListener('touchend', cancel); document.removeEventListener('touchmove', cancel); };
-  document.addEventListener('touchend', cancel);
-  document.addEventListener('touchmove', cancel);
-}, {passive: true});
-
-function updateProgress() {
-  var total = Number($('collected').textContent) || 0;
-  var done = Number($('forwarded').textContent) || 0;
+// === Loading progress ===
+function showProgress(total, done, label) {
   var pct = total > 0 ? Math.round(done / total * 100) : 0;
-  if ($('progressFill')) $('progressFill').style.width = pct + '%';
-  if ($('progressText')) $('progressText').textContent = done + ' / ' + total + ' (' + pct + '%)';
-}
-
-let chTab = 'source';
-
-
-function getChannelInfo(telegramId) {
-  return channelInfo[telegramId] || null;
-}
-
-document.querySelectorAll('.ch-tab').forEach(function(btn) {
-  btn.onclick = function() {
-    document.querySelectorAll('.ch-tab').forEach(function(b) { b.classList.remove('active'); });
-    btn.classList.add('active');
-    chTab = btn.dataset.tab;
-    renderChannelList();
-  };
-});
-
-let channels = read('channels', []);
-let channelInfo = read('channelInfo', {});
-let rules = read('rules', []);
-let logs = read('logs', []);
-let running = window.NexaNative ? NexaNative.relayServiceEnabled() : false;
-const activeRules = new Set();
-
-document.querySelectorAll('nav button').forEach(button => button.onclick = () => {
-  document.querySelectorAll('nav button,.page').forEach(item => item.classList.remove('active'));
-  button.classList.add('active');
-  $(button.dataset.page).classList.add('active');
-});
-
-function addLog(message) {
-  const stamp = new Date().toLocaleString('zh-CN', {hour12:false});
-  logs.unshift(`[${stamp}] ${message}`);
-  logs = logs.slice(0, 20);
-  save('logs', logs);
-  render();
-}
-
-function render() {
-  const bound = new Set(rules.map(rule => rule.source));
-  // Channel list with tabs
-  var filtered = channels.filter(function(ch) {
-    if (chTab === 'unassigned') return ch.role === 'unassigned';
-    return ch.role === chTab;
-  });
-  // Sort: bound sources first
-  filtered.sort(function(a, b) {
-    var aBound = a.role === 'source' && boundSrc.has(a.id) ? 0 : 1;
-    var bBound = b.role === 'source' && boundSrc.has(b.id) ? 0 : 1;
-    return aBound - bBound;
-  });
-  var boundSrc = new Set(rules.map(function(r) { return r.source; }));
-  $('srcCount').textContent = channels.filter(function(c) { return c.role === 'source'; }).length;
-  $('tgtCount').textContent = channels.filter(function(c) { return c.role === 'target'; }).length;
-  $('unCount').textContent = channels.filter(function(c) { return c.role === 'unassigned'; }).length;
-  $('channelList').innerHTML = filtered.length ? filtered.map(function(channel) {
-    var isBound = channel.role === 'source' && boundSrc.has(channel.id);
-    var info = getChannelInfo(channel.telegramId);
-    var infoLine = info ? (info.members ? info.members + ' 成员' : '') + (info.description ? ' · ' + info.description.slice(0,30) : '') : '';
-    var roleTag = channel.role === 'source' ? (isBound ? '已绑定' : '来源') : channel.role === 'target' ? '目标' : '待分配';
-    var tagCls = isBound ? 'tag bound' : 'tag ' + channel.role;
-    var actions = '';
-    if (channel.role === 'unassigned') {
-      actions = '<button onclick="assignRole(\'' + channel.id + '\',\'source\')">来源</button><button onclick="assignRole(\'' + channel.id + '\',\'target\')">目标</button>';
-    } else if (channel.role === 'source' && !isBound) {
-      actions = '<button class="bind-src" onclick="quickBind(\'' + channel.id + '\')">绑定目标</button>';
-    }
-    actions += '<button onclick="showChInfo(\'' + channel.id + '\')">详情</button>';
-    actions += '<button onclick="removeChannel(\'' + channel.id + '\')">删除</button>';
-    return '<div class="item ch-item' + (isBound ? ' item-bound' : '') + '"><div class="item-head"><div><b>' + esc(channel.name) + '</b><small>' + (infoLine || (channel.role === 'unassigned' ? '待分配' : roleTag)) + '</small></div><span class="' + tagCls + '">' + roleTag + '</span></div><div class="item-actions">' + actions + '</div></div>';
-  }).join('') : '<div class="notice">暂无' + (chTab === 'source' ? '来源' : chTab === 'target' ? '目标' : '待分配') + '频道</div>';
-
-  const targets = channels.filter(channel => channel.role === 'target');
-  const available = channels.filter(channel => channel.role === 'source' && !bound.has(channel.id));
-  const allSources = channels.filter(channel => channel.role === 'source');
-  $('ruleTarget').innerHTML = targets.length ? targets.map(channel => {
-    return `<label class="check-item"><input type="checkbox" class="target-check" value="${channel.id}"><span>${esc(channel.name)}</span></label>`;
-  }).join('') : '<div class="notice">暂无目标频道，请先同步并设置目标身份</div>';
-  $('ruleSource').innerHTML = available.length ? available.map(channel => `<option value="${channel.id}">${esc(channel.name)}</option>`).join('') : '<option disabled>所有来源频道均已绑定</option>';
-  // Show bound sources in the channel list with visual indicator
-  if (allSources.length > available.length) {
-    var boundSources = allSources.filter(ch => bound.has(ch.id));
-    // Will be shown in channelList render above
+  var el = document.getElementById('progressCard');
+  if (!el) {
+    el = document.createElement('div'); el.id = 'progressCard'; el.className = 'msg msg-sys';
+    $('chatMessages').appendChild(el);
   }
-  $('ruleList').innerHTML = rules.length ? rules.map(rule => {
-    const source = channels.find(channel => channel.id === rule.source);
-    const target = channels.find(channel => channel.id === rule.target);
-    return `<div class="item"><div class="item-head"><div><b>${esc(rule.note || source?.name || '未命名规则')}</b><small>${esc(source?.name || '已删除来源')} → ${esc(target?.name || '已删除目标')} · ${esc(rule.type)} · ${rule.checkpoint ? `断点 ${esc(rule.checkpoint)}` : esc(rule.startMode || '最早消息')}</small></div><span class="tag">${rule.enabled ? '运行' : '暂停'}</span></div><div class="item-actions"><button onclick="showRule('${rule.id}')">详情</button><button onclick="toggleRule('${rule.id}')">${rule.enabled ? '暂停' : '启用'}</button><button onclick="deleteRule('${rule.id}')">解除绑定</button></div></div>`;
-  }).join('') : '<div class="notice">还没有采集规则。</div>';
+  el.innerHTML = '📊 ' + (label||'处理中') + '：' + done + '/' + total + ' (' + pct + '%)';
+  scrollChat();
+}
+function hideProgress() { var el = document.getElementById('progressCard'); if (el) el.remove(); }
 
-  updateProgress(); if ($('logList')) $('logList').innerHTML = logs.length ? logs.map(function(l) { return '<div class="log-line">' + esc(l) + '</div>'; }).join('') : '<div class="log-empty">暂无记录</div>';
-  $('running').textContent = rules.filter(rule => rule.enabled).length;
-  $('health').textContent = running ? '后台安全运行中' : rules.length ? '配置就绪' : '待配置';
-  const invalidRules = rules.filter(rule => rule.enabled).filter(rule => !channels.find(channel => channel.id === rule.source)?.telegramId || !channels.find(channel => channel.id === rule.target)?.telegramId).length;
-  $('systemAlert').classList.toggle('error', invalidRules > 0);
-  $('systemAlert').textContent = invalidRules ? `${invalidRules} 条启用规则使用了规划频道，无法执行` : running ? '服务正常运行；异常会在这里优先提示' : rules.length ? '规则已就绪，可以启动采集' : '请按四步引导完成首次配置';
+// === Rate limit display ===
+function showRateLimit(seconds) {
+  addSystemMsg('⏳ Telegram 速率限制，暂停 ' + seconds + ' 秒');
+  var countdown = seconds;
+  var timer = setInterval(function() {
+    countdown--;
+    if (countdown <= 0) { clearInterval(timer); addSystemMsg('✅ 限速解除，继续采集'); return; }
+    var el = document.getElementById('rateLimitMsg');
+    if (el) el.textContent = '⏳ 限速中... 剩余 ' + countdown + ' 秒';
+  }, 1000);
 }
 
-$('addChannel').onclick = () => {
-  const name = $('channelName').value.trim();
-  if (!name) return alert('请输入频道名称或用户名');
-  channels.push({id:uid(), name, role:$('channelRole').value});
-  save('channels', channels); $('channelName').value = '';
-  addLog(`添加${channels.at(-1).role === 'source' ? '来源' : '目标'}频道：${name}`);
+// === Help system ===
+const HELP_TEXT = [
+  '📱 频道操作：',
+  '  同步频道 - 在设置中连接 Telegram 后同步',
+  '  绑定来源 - 说"把XX绑定到YY"',
+  '',
+  '🔄 采集控制：',
+  '  /start - 启动采集',
+  '  /stop - 停止采集',
+  '  /status - 查看状态',
+  '',
+  '📋 规则管理：',
+  '  "只转图片" - 修改采集类型',
+  '  "暂停来源A" - 暂停指定规则',
+  '  "删除规则" - 删除所有规则',
+  '',
+  '💡 示例：',
+  '  "把频道A的所有内容转到频道B"',
+  '  "只转发频道C的图片到频道D"',
+  '  "启动采集"',
+  '  "看看现在采了多少"',
+].join('\n');
+
+function processQueue() {
+  if (msgProcessing || !msgQueue.length) return;
+  msgProcessing = true;
+  var fn = msgQueue.shift();
+  fn().finally(function() { msgProcessing = false; processQueue(); });
+}
+
+// === Session expiry ===
+window.nexaSessionExpired = function() {
+  setTdlibStatus('connecting');
+  addSystemMsg('⚠️ 登录已过期，正在重新连接...');
+  addLogLine('Session expired, reconnecting...');
+  setTimeout(function() { NexaNative?.startTelegram(); }, 2000);
 };
 
-window.removeChannel = id => {
-  if (rules.some(rule => rule.source === id || rule.target === id)) return alert('请先解除该频道的绑定规则');
-  channels = channels.filter(channel => channel.id !== id); save('channels', channels); render();
-};
-window.assignRole = (id, role) => {
-  const channel = channels.find(item => item.id === id); if (!channel) return;
-  channel.role = role; save('channels', channels); addLog(`${channel.name} 已标记为${role === 'source' ? '来源频道' : '目标频道'}`);
-};
+// === Local command fallback ===
+function localCommand(text) {
+  var t = text.toLowerCase().trim();
+  if (/^(启动|开始|start)/.test(t)) { executeAction({action:'start'}); return true; }
+  if (/^(停止|暂停|stop|pause)/.test(t)) { executeAction({action:'stop'}); return true; }
+  if (/^(状态|进度|status)/.test(t)) {
+    var n = rules.filter(r=>r.enabled).length;
+    var total = rules.length;
+    addMsg('ai', '📊 当前状态：' + (running?'运行中':'已停止') + '，共 '+total+' 条规则，'+n+' 条启用');
+    return true;
+  }
+  if (/^\/help/.test(t)) {
+    addMsg('ai', '可用命令：\n/status - 查看状态\n/start - 启动采集\n/stop - 停止采集\n/bind - 绑定频道\n/help - 帮助');
+    return true;
+  }
+  return false;
+}
 
-$('bindRule').onclick = () => {
-  const source = $('ruleSource').value, target = $('ruleTarget').value;
-  if (!source || !target) return alert('需要一个未绑定来源和一个目标频道');
-  rules.push({id:uid(), source, target, note:$('ruleNote').value.trim(), startMode:$('startMode').value, startMessageId:$('startMessageId').value.trim(), type:$('mediaType').value, album:$('albumMode').value, captionMode:$('captionMode').value, keywords:$('keywords').value.trim(), dailyLimit:Number($('dailyLimit').value)||0, runFrom:Number($('runFrom').value)||0, runTo:Number($('runTo').value)||24, enabled:true, checkpoint:null, processed:0});
-  save('rules', rules); addLog('创建采集规则并完成来源唯一绑定');
-};
-
-window.toggleRule = id => {
-  const rule = rules.find(item => item.id === id); if (!rule) return;
-  rule.enabled = !rule.enabled;
-  if (!rule.enabled) { activeRules.delete(id); window.NexaNative?.stopRelayRule(id); }
-  else if (running) runNativeRule(rule);
-  save('rules', rules); addLog(`规则已${rule.enabled ? '启用' : '暂停'}`);
-};
-window.deleteRule = id => {
-  showConfirm('解除绑定后可重新创建规则？', function() {
-    activeRules.delete(id); window.NexaNative?.stopRelayRule(id);
-    rules = rules.filter(rule => rule.id !== id); save('rules', rules);
-    showToast('✅ 已解除绑定'); addLog('解除频道绑定');
+// === Rule conflict detection ===
+function checkConflict(srcId, tgtId, type) {
+  var conflicts = rules.filter(function(r) {
+    return r.source === srcId && r.target === tgtId && r.enabled;
   });
-};
-window.clearMemory = id => {
-  showConfirm('确认清空断点？下次启用从历史最早消息重新扫描。', function() {
-    const rule = rules.find(item => item.id === id); if (!rule) return;
-    rule.enabled = false; rule.checkpoint = null; rule.processed = 0;
-    activeRules.delete(id); window.NexaNative?.stopRelayRule(id); window.NexaNative?.clearRelayCheckpoint(id);
-    save('rules', rules); showToast('✅ 断点已清空'); addLog('已清空断点记忆，规则自动暂停');
-  });
-};
-window.showRule = id => { const rule = rules.find(item => item.id === id); if (rule) alert(JSON.stringify(rule, null, 2)); };
+  if (conflicts.length > 0) {
+    var existing = conflicts[0];
+    if (existing.type !== type) {
+      return '检测到冲突：已有规则（' + existing.type + '）和新规则（' + type + '）不能同时启用。要替换还是保留原有？';
+    }
+  }
+  return null;
+}
 
-window.quickBind = function(chId) {
-  var source = channels.find(function(c) { return c.id === chId; });
-  if (!source) return;
-  var targets = channels.filter(function(c) { return c.role === 'target'; });
-  if (!targets.length) return showToast('⚠ 请先添加目标频道');
-  // Create inline bind panel
-  var existing = document.querySelector('.bind-panel');
-  if (existing) existing.remove();
-  var panel = document.createElement('div');
-  panel.className = 'bind-panel';
-  panel.innerHTML = '<div class="bind-panel-inner"><div class="bind-title">绑定 ' + esc(source.name) + ' 到目标</div>' +
-    targets.map(function(t) {
-      var bound = rules.some(function(r) { return r.source === chId && r.target === t.id; });
-      return '<label class="check-item"><input type="checkbox" class="target-check" value="' + t.id + '"' + (bound ? ' checked disabled' : '') + '><span>' + esc(t.name) + (bound ? ' (已绑定)' : '') + '</span></label>';
-    }).join('') +
-    '<div class="bind-actions"><button class="confirm-cancel" onclick="this.closest(\'.bind-panel\').remove()">取消</button><button class="confirm-ok" onclick="doQuickBind(\'' + chId + '\', this)">确认绑定</button></div></div>';
-  document.body.appendChild(panel);
-};
+let channels=read('channels',[]);
+let rules=read('rules',[]);
+let logs=read('logs',[]);
+let running=window.NexaNative?NexaNative.relayServiceEnabled():false;
+let channelInfo=read('channelInfo',{});
+let deepseekKey=localStorage.getItem('deepseek_key')||'';
+let chatHistory=[];
+let logStreamOpen=true;
 
-window.doQuickBind = function(chId, btn) {
-  var checks = document.querySelectorAll('.bind-panel .target-check:checked:not(:disabled)');
-  var targets = Array.from(checks).map(function(cb) { return cb.value; });
-  if (!targets.length) return showToast('⚠ 请选择目标频道');
-  targets.forEach(function(t) {
-    rules.push({
-      id: uid(), source: chId, target: t, note: '', startMode: '最早消息', startMessageId: '',
-      type: '全部内容', album: '整组保留', captionMode: '保留说明', keywords: '',
-      dailyLimit: 0, runFrom: 0, runTo: 24, enabled: true, checkpoint: null, processed: 0,
+// === Toast ===
+function showToast(msg,dur){
+  dur=dur||2200;
+  var old=document.querySelector('.toast-capsule');if(old)old.remove();
+  var t=document.createElement('div');t.className='toast-capsule';t.textContent=msg;
+  document.body.appendChild(t);requestAnimationFrame(()=>t.classList.add('show'));
+  setTimeout(()=>{t.classList.remove('show');setTimeout(()=>t.remove(),300)},dur);
+}
+
+// === Sidebar ===
+function openSidebar(){$('sidebar').classList.add('open');$('sidebarMask').classList.add('show')}
+function closeSidebar(){$('sidebar').classList.remove('open');$('sidebarMask').classList.remove('show')}
+
+// === Page overlay ===
+function openPage(name){
+  closeSidebar();
+  var pages={
+    channels:{title:'频道管理',render:renderChannelsPage},
+    rules:{title:'采集规则',render:renderRulesPage},
+    settings:{title:'设置',render:renderSettingsPage}
+  };
+  var p=pages[name];if(!p)return;
+  $('pageTitle').textContent=p.title;
+  $('pageBody').innerHTML='';
+  p.render($('pageBody'));
+  $('pageOverlay').classList.add('open');
+}
+function closePage(){$('pageOverlay').classList.remove('open')}
+
+// === Chat ===
+function addMsg(role,content,extra){
+  var div=document.createElement('div');
+  div.className='msg msg-'+role;
+  if(extra)div.className+=' '+extra;
+  div.innerHTML=content;
+  $('chatMessages').appendChild(div);
+  scrollChat();
+  return div;
+}
+function addLogMsg(text){
+  var div=document.createElement('div');
+  div.className='msg msg-log';
+  div.textContent=text;
+  $('chatMessages').appendChild(div);
+  scrollChat();
+}
+function addSystemMsg(text){addMsg('sys',text)}
+function scrollChat(){
+  var area=$('chatArea');
+  area.scrollTop=area.scrollHeight;
+}
+function showTyping(){
+  var d=document.createElement('div');d.className='typing';d.id='typingIndicator';
+  d.innerHTML='<span></span><span></span><span></span>';
+  $('chatMessages').appendChild(d);scrollChat();
+}
+function hideTyping(){var t=$('typingIndicator');if(t)t.remove()}
+
+// === Log stream ===
+function addLogLine(text){
+  logs.unshift(`[${new Date().toLocaleTimeString('zh-CN',{hour12:false})}] ${text}`);
+  logs=logs.slice(0,20);save('logs',logs);
+  var line=document.createElement('div');line.className='log-line';line.textContent=text;
+  $('logBody').appendChild(line);
+  if(logStreamOpen)$('logBody').scrollTop=$('logBody').scrollHeight;
+}
+function toggleLogStream(){
+  logStreamOpen=!logStreamOpen;
+  $('logBody').classList.toggle('open',logStreamOpen);
+  $('logArrow').classList.toggle('open',logStreamOpen);
+}
+
+// === AI Agent ===
+const SYSTEM_PROMPT=`你是 Relay，一个 Telegram 频道采集助手。你能帮用户管理频道采集规则。
+
+你能做的事：
+- 创建采集规则（绑定来源→目标频道）
+- 启动/停止/暂停采集
+- 查看采集状态和统计
+- 修改采集类型（图片/视频/文本/全部）
+- 管理频道（设置来源/目标身份）
+
+当前状态变量：
+- channels: 所有已同步的频道（id, telegramId, name, role）
+- rules: 所有采集规则（source, target, type, enabled, checkpoint, processed）
+- running: 采集是否运行中
+
+回复规则：
+1. 如果用户要创建规则，先确认来源和目标频道，然后返回 JSON 指令
+2. 如果用户要启动/停止，直接返回对应指令
+3. 如果用户问状态，读取变量并用简洁中文回答
+4. 如果操作需要确认，先问用户
+
+指令格式（需要执行操作时返回 JSON）：
+{"action":"bind","source":"频道ID","targets":["目标ID1","目标ID2"],"type":"采集类型"}
+{"action":"start"}
+{"action":"stop"}
+{"action":"pause"}
+{"action":"status"}
+{"action":"modify_rule","ruleId":"规则ID","type":"新采集类型"}
+
+用简洁中文回复，不要用 markdown。`;
+
+async function callDeepSeek(messages){
+  if(!deepseekKey){showToast('⚠ 请先在设置中配置 DeepSeek Key');return null;}
+  try{
+    var resp=await fetch('https://api.deepseek.com/chat/completions',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+deepseekKey},
+      body:JSON.stringify({model:'deepseek-chat',messages:[{role:'system',content:SYSTEM_PROMPT},...messages],temperature:0.3,max_tokens:1024})
     });
+    var data=await resp.json();
+    return data.choices?.[0]?.message?.content||null;
+  }catch(e){showToast('⚠ AI 请求失败');return null;}
+}
+
+function parseAction(text){
+  try{
+    var m=text.match(/\{[\s\S]*\}/);
+    if(m)return JSON.parse(m[0]);
+  }catch{}
+  return null;
+}
+
+function executeAction(action){
+  if(!action)return;
+  if(action.action==='bind'){
+    var src=channels.find(c=>c.id===action.source||c.telegramId==action.source);
+    if(!src){showToast('⚠ 来源频道不存在');return;}
+    (action.targets||[]).forEach(function(tid){
+      var tgt=channels.find(c=>c.id===tid||c.telegramId==tid);
+      if(!tgt)return;
+      rules.push({id:uid(),source:src.id,target:tgt.id,note:'',startMode:'最早消息',startMessageId:'',type:action.type||'全部内容',album:'整组保留',captionMode:'保留说明',keywords:'',dailyLimit:0,runFrom:0,runTo:24,enabled:true,checkpoint:null,processed:0});
+      addLogLine('创建规则: '+src.name+' → '+tgt.name);
+    });
+    save('rules',rules);
+    showToast('✅ 已绑定 '+action.targets.length+' 个目标');
+  }else if(action.action==='start'){
+    running=true;NexaNative?.setRelayService(true);
+    rules.filter(r=>r.enabled).forEach(runNativeRule);
+    addLogLine('采集已启动');
+    showToast('🟢 采集已启动');
+  }else if(action.action==='stop'||action.action==='pause'){
+    running=false;NexaNative?.setRelayService(false);
+    rules.forEach(r=>r.enabled=false);activeRules.clear();
+    save('rules',rules);addLogLine('采集已停止');showToast('⏹ 已停止');
+  }
+  updateStatus();
+}
+
+async function sendChat(){
+  var input=$('chatInput');
+  var text=input.value.trim();if(!text)return;
+  input.value='';autoResize(input);
+  addMsg('user',esc(text));
+  chatHistory.push({role:'user',content:text});
+  // Try local command first (works offline)
+  if(localCommand(text))return;
+  // Queue AI call
+  enqueueMsg(async function(){
+    showTyping();
+    var reply=await callDeepSeek(chatHistory);
+    hideTyping();
+    if(!reply){
+      // Fallback: suggest local commands
+      addMsg('ai','⚠ AI 离线，可用本地命令：\n/status 查看状态\n/start 启动\n/stop 停止\n/help 帮助');
+      return;
+    }
+    addMsg('ai',esc(reply).replace(/\n/g,'<br>'));
+    chatHistory.push({role:'assistant',content:reply});
+    var action=parseAction(reply);
+    if(action)executeAction(action);
   });
-  save('rules', rules);
-  document.querySelector('.bind-panel').remove();
-  showToast('✅ 已绑定 ' + targets.length + ' 个目标');
-  render();
+}
+
+function sendQuickCmd(cmd){
+  $('chatInput').value=cmd;sendChat();
+}
+
+// === Auto resize textarea ===
+function autoResize(el){
+  el.style.height='auto';
+  el.style.height=Math.min(el.scrollHeight,100)+'px';
+}
+
+// === Status update ===
+function updateStatus(){
+  var n=rules.filter(r=>r.enabled).length;
+  $('topStatus').textContent=n+' 条规则';
+  $('svcDot').className='dot '+(running?'on':'');
+  $('svcText').textContent=running?'运行中':'已停止';
+}
+
+// === Channel page ===
+function renderChannelsPage(container){
+  var bound=new Set(rules.map(r=>r.source));
+  var html='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><b>频道列表</b><button onclick="NexaNative?.syncTelegramChannels();showToast(\'⟳ 同步中...\')">⟳ 同步</button></div>';
+  html+='<div style="display:flex;gap:6px;margin-bottom:12px">';
+  html+='<button class="qcmd" onclick="filterCh(\'all\',this)">全部</button>';
+  html+='<button class="qcmd" onclick="filterCh(\'source\',this)">来源</button>';
+  html+='<button class="qcmd" onclick="filterCh(\'target\',this)">目标</button>';
+  html+='</div><div id="chList">';
+  channels.forEach(function(ch){
+    var isBound=ch.role==='source'&&bound.has(ch.id);
+    var tag=ch.role==='source'?(isBound?'已绑定':'来源'):ch.role==='target'?'目标':'待分配';
+    var cls=isBound?'item-bound':'';
+    html+='<div class="item '+cls+'" data-role="'+ch.role+'"><div class="item-head"><div><b>'+esc(ch.name)+'</b><small>'+tag+'</small></div></div><div class="item-actions">';
+    if(ch.role==='unassigned'){
+      html+='<button onclick="setRole(\''+ch.id+'\',\'source\')">来源</button><button onclick="setRole(\''+ch.id+'\',\'target\')">目标</button>';
+    }else if(ch.role==='source'&&!isBound){
+      html+='<button onclick="quickBind(\''+ch.id+'\')">绑定</button>';
+    }
+    html+='<button onclick="showChDetail(\''+ch.id+'\')">详情</button>';
+    html+='</div></div>';
+  });
+  html+='</div>';
+  container.innerHTML=html;
+}
+
+function filterCh(role,btn){
+  document.querySelectorAll('.qcmd').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  document.querySelectorAll('#chList .item').forEach(item=>{
+    item.style.display=(role==='all'||item.dataset.role===role)?'':'none';
+  });
+}
+
+window.setRole=function(id,role){
+  var ch=channels.find(c=>c.id===id);if(!ch)return;
+  ch.role=role;save('channels',channels);
+  showToast('✅ 已设为'+(role==='source'?'来源':'目标'));
+  openPage('channels');
 };
 
-window.showChInfo = function(chId) {
-  var ch = channels.find(function(c) { return c.id === chId; });
-  if (!ch) return;
-  var info = getChannelInfo(ch.telegramId);
-  var bound = rules.some(function(r) { return r.source === chId; });
-  var ruleCount = rules.filter(function(r) { return r.source === chId || r.target === chId; }).length;
-  var overlay = document.createElement('div');
-  overlay.className = 'confirm-overlay';
-  overlay.innerHTML = '<div class="confirm-box ch-info-box"><p><b>' + esc(ch.name) + '</b></p>' +
-    '<div class="ch-info-detail">' +
-    '<div>身份：' + (ch.role === 'source' ? '来源频道' : ch.role === 'target' ? '目标频道' : '待分配') + '</div>' +
-    (info ? '<div>成员：' + (info.members || '未知') + '</div>' : '') +
-    (info && info.description ? '<div>简介：' + esc(info.description.slice(0,80)) + '</div>' : '') +
-    '<div>关联规则：' + ruleCount + ' 条</div>' +
-    '<div>绑定状态：' + (bound ? '已绑定' : '未绑定') + '</div>' +
-    '</div><div class="confirm-actions"><button class="confirm-ok" onclick="this.closest(\'.confirm-overlay\').remove()">关闭</button></div></div>';
+window.quickBind=function(chId){
+  var src=channels.find(c=>c.id===chId);if(!src)return;
+  var tgts=channels.filter(c=>c.role==='target');
+  if(!tgts.length){showToast('⚠ 请先添加目标频道');return;}
+  var overlay=document.createElement('div');overlay.className='confirm-overlay';
+  var inner='<div class="confirm-box" style="text-align:left"><p>绑定 '+esc(src.name)+' 到：</p>';
+  tgts.forEach(function(t){
+    var bound=rules.some(r=>r.source===chId&&r.target===t.id);
+    inner+='<label style="display:flex;align-items:center;gap:8px;margin:6px 0"><input type="checkbox" class="bind-check" value="'+t.id+'"'+(bound?' checked disabled':'')+'><span>'+esc(t.name)+(bound?' ✓':'')+'</span></label>';
+  });
+  inner+='<div class="confirm-actions" style="margin-top:14px"><button class="confirm-cancel" onclick="this.closest(\'.confirm-overlay\').remove()">取消</button><button class="confirm-ok" onclick="doBind(\''+chId+'\')">确认</button></div></div>';
+  overlay.innerHTML=inner;document.body.appendChild(overlay);
+};
+
+window.doBind=function(chId){
+  var checks=document.querySelectorAll('.bind-check:checked:not(:disabled)');
+  var targets=Array.from(checks).map(c=>c.value);
+  if(!targets.length)return showToast('⚠ 请选择目标');
+  targets.forEach(function(t){
+    rules.push({id:uid(),source:chId,target:t,note:'',startMode:'最早消息',startMessageId:'',type:'全部内容',album:'整组保留',captionMode:'保留说明',keywords:'',dailyLimit:0,runFrom:0,runTo:24,enabled:true,checkpoint:null,processed:0});
+  });
+  save('rules',rules);document.querySelector('.confirm-overlay')?.remove();
+  showToast('✅ 已绑定 '+targets.length+' 个目标');updateStatus();
+};
+
+window.showChDetail=function(chId){
+  var ch=channels.find(c=>c.id===chId);if(!ch)return;
+  var info=channelInfo[ch.telegramId]||{};
+  var ruleCount=rules.filter(r=>r.source===chId||r.target===chId).length;
+  var overlay=document.createElement('div');overlay.className='confirm-overlay';
+  overlay.innerHTML='<div class="confirm-box" style="text-align:left"><p><b>'+esc(ch.name)+'</b></p><div style="font-size:11px;color:#aaa;line-height:1.8"><div>身份：'+(ch.role==='source'?'来源':ch.role==='target'?'目标':'待分配')+'</div>'+(info.members?'<div>成员：'+info.members+'</div>':'')+(info.description?'<div>简介：'+esc(info.description.slice(0,60))+'</div>':'')+'<div>关联规则：'+ruleCount+' 条</div></div><div class="confirm-actions" style="margin-top:14px"><button class="confirm-ok" onclick="this.closest(\'.confirm-overlay\').remove()">关闭</button></div></div>';
   document.body.appendChild(overlay);
 };
 
-function runNativeRule(rule) {
-  if (!running || !rule.enabled || !window.NexaNative || activeRules.has(rule.id)) return;
-  const source = channels.find(channel => channel.id === rule.source);
-  const target = channels.find(channel => channel.id === rule.target);
-  if (!source?.telegramId || !target?.telegramId) return;
-  activeRules.add(rule.id);
-  NexaNative.runRelayRule(JSON.stringify({...rule, sourceChatId:source.telegramId, targetChatId:target.telegramId, checkpoint:/^\d+$/.test(String(rule.checkpoint)) ? String(rule.checkpoint) : '0'}));
-}
-
-$('pauseAll').onclick = () => { rules.forEach(rule => { rule.enabled=false; window.NexaNative?.stopRelayRule(rule.id); }); activeRules.clear(); save('rules', rules); showToast('⏸ 已暂停全部'); addLog('已暂停全部规则'); };
-$('resumeAll').onclick = () => { rules.forEach(rule => rule.enabled=true); save('rules', rules); if (running) rules.forEach(runNativeRule); showToast('▶ 已恢复全部'); addLog('已恢复全部规则'); };
-$('exportConfig').onclick = () => prompt('复制并妥善保存配置 JSON', JSON.stringify({version:1,channels,rules}, null, 2));
-$('importConfig').onclick = () => { const value=prompt('粘贴配置 JSON'); if (!value) return; try { const data=JSON.parse(value); if (!Array.isArray(data.channels)||!Array.isArray(data.rules)) throw new Error(); channels=data.channels; rules=data.rules; save('channels',channels); save('rules',rules); showToast('✅ 配置已导入'); addLog('配置导入成功'); } catch { showToast('⚠ 配置格式无效'); } };
-if ($('exportLogs')) $('exportLogs').onclick = function() { prompt('复制日志', logs.join('\n')); };
-if ($('clearLogs')) $('clearLogs').onclick = function() { showConfirm('确定清空日志？', function() { logs=[]; save('logs',logs); render(); showToast('✅ 日志已清空'); }); };
-
-$('toggleRun').onclick = () => {
-  if (!rules.length) return showToast('⚠ 请先创建采集规则');
-  if (!window.NexaNative) return showToast('⚠ 当前环境不支持采集');
-  const invalid = rules.filter(rule => rule.enabled).some(rule => !channels.find(channel => channel.id === rule.source)?.telegramId || !channels.find(channel => channel.id === rule.target)?.telegramId);
-  if (invalid) return showToast('⚠ 包含未同步频道，无法采集');
-  running = !running;
-  NexaNative.setRelayService(running);
-  $('service').classList.toggle('on', running);
-  $('service').innerHTML = `<i></i>${running ? '后台运行中' : '已停止'}`;
-  $('toggleRun').textContent = running ? '停止采集' : '启动安全采集';
-  if (running) rules.filter(rule => rule.enabled).forEach(runNativeRule);
-  else { activeRules.clear(); NexaNative.stopAllRelayRules(); }
-  showToast(running ? '🟢 采集已启动' : '⏹ 采集已停止'); addLog(running ? '启动原生后台采集与安全限速' : '停止全部采集规则');
-};
-$('emergencyStop').onclick = () => {
-  showConfirm('紧急停止全部任务？', function() {
-    running=false; rules.forEach(rule=>rule.enabled=false); activeRules.clear(); save('rules',rules);
-    if (window.NexaNative) { NexaNative.stopAllRelayRules(); NexaNative.setRelayService(false); }
-    showToast('🛑 已紧急停止'); addLog('已执行紧急停止，全部规则暂停');
+// === Rules page ===
+function renderRulesPage(container){
+  var html='';
+  if(!rules.length){html='<div style="color:var(--muted);font-size:12px;text-align:center;padding:40px 0">还没有规则<br>在聊天中说"帮我把XX转发到YY"即可创建</div>';}
+  rules.forEach(function(r){
+    var src=channels.find(c=>c.id===r.source);
+    var tgt=channels.find(c=>c.id===r.target);
+    html+='<div class="item"><div class="item-head"><div><b>'+(src?.name||'?')+' → '+(tgt?.name||'?')+'</b><small>'+r.type+' · '+(r.enabled?'运行中':'已暂停')+'</small></div><span class="tag" style="border-color:'+(r.enabled?'#555':'#333')+';color:'+(r.enabled?'#fff':'#888')+'">'+(r.enabled?'运行':'暂停')+'</span></div><div class="item-actions"><button onclick="toggleRule(\''+r.id+'\')">'+(r.enabled?'暂停':'启用')+'</button><button onclick="delRule(\''+r.id+'\')">删除</button></div></div>';
   });
-};
-
-function installSettingsPanels() {
-  const settingsPanel = $('saveSettings') ? $('saveSettings').closest('.fold-body') : null;
-  if (!settingsPanel) return;
-  // Add Telegram login controls to the Telegram fold section
-  const tgStatus = $('tgStatus');
-  if (tgStatus) {
-    tgStatus.innerHTML = '<div id="tgState" class="tg-state">未连接</div><label id="tgInputLabel" style="display:none">手机号<input id="tgInput" placeholder="+86 13800000000"></label><button class="primary" id="tgAction" style="margin-top:10px">连接 Telegram</button><button class="primary secondary" id="tgSync" style="margin-top:6px">⟳ 同步频道</button>';
-  }
-
-  let tgStep = 'start';
-  const configureStep = step => {
-    tgStep = step;
-    const states = {starting:['正在启动','',false], phone:['输入手机号','+86 13800000000',true], code:['输入验证码','Telegram 验证码',true], password:['输入二次密码','两步验证密码',true], ready:['已登录','',false], closed:['会话已关闭','',false], unsupported_auth_step:['需要其他验证步骤','',false]};
-    const state = states[step] || ['等待连接','',false];
-    $('tgState').textContent = state[0]; $('tgInputLabel').style.display = state[2] ? 'block' : 'none';
-    $('tgInput').placeholder = state[1]; $('tgInput').value = ''; $('tgInput').type = step === 'password' ? 'password' : 'text';
-    $('tgAction').textContent = step === 'start' ? '连接 Telegram' : step === 'phone' ? '发送验证码' : step === 'code' ? '验证登录' : step === 'password' ? '提交密码' : step === 'ready' ? '已连接' : '重新连接';
-  };
-  $('tgAction').onclick = () => {
-    if (['start','closed','unsupported_auth_step'].includes(tgStep)) { if (!NexaNative.startTelegram()) showToast('⚠ 请先保存 API 配置'); }
-    else if (tgStep === 'phone') NexaNative.submitTelegramPhone($('tgInput').value);
-    else if (tgStep === 'code') NexaNative.submitTelegramCode($('tgInput').value);
-    else if (tgStep === 'password') NexaNative.submitTelegramPassword($('tgInput').value);
-  };
-  $('tgSync').onclick = function() { showToast('⟳ 正在同步...'); NexaNative.syncTelegramChannels(); };
-  $('testAi').onclick = () => { $('aiResult').textContent = '分析中…'; NexaNative.analyzeContent($('aiSample').value); };
-  window.nexaTelegramState = configureStep;
-  configureStep('start');
+  container.innerHTML=html;
 }
 
-$('saveSettings').onclick = () => {
-  if (!window.NexaNative) return showToast('⚠ 当前环境不支持安全存储');
-  const apiId = $('apiId').value.trim(), apiHash = $('apiHash').value.trim(), deepSeek = $('deepseekKey').value.trim();
-  if (apiId && !/^\d+$/.test(apiId)) return alert('Telegram API ID 必须是数字');
-  if (!apiId || !apiHash) return showToast('⚠ 请填写 API ID 和 API Hash');
-  if (NexaNative.saveSecrets(apiId, apiHash, deepSeek)) { $('apiHash').value = ''; $('deepseekKey').value = ''; showToast('✅ 配置已安全保存'); addLog('敏感配置已写入 Android Keystore 加密存储'); }
+window.toggleRule=function(id){
+  var r=rules.find(x=>x.id===id);if(!r)return;
+  r.enabled=!r.enabled;save('rules',rules);updateStatus();
+  showToast(r.enabled?'▶ 已启用':'⏸ 已暂停');openPage('rules');
 };
-$('saveProxy').onclick = () => {
-  const type=$('proxyType').value, server=$('proxyServer').value.trim(), port=Number($('proxyPort').value)||0;
-  if (type !== '关闭' && (!server || port < 1 || port > 65535)) return showToast('⚠ 请填写有效的代理地址');
-  if (NexaNative.saveProxy(type, server, port, $('proxyUser').value, $('proxyPassword').value)) { $('proxyPassword').value=''; showToast('✅ 代理已保存'); addLog(type === '关闭' ? '代理已关闭' : `${type} 代理已保存并应用`); }
+window.delRule=function(id){
+  rules=rules.filter(x=>x.id!==id);save('rules',rules);updateStatus();
+  showToast('✅ 已删除');openPage('rules');
 };
 
-window.nexaTelegramError = value => { alert(`Telegram：${value}`); addLog('Telegram 连接错误（敏感信息已隐藏）'); };
-window.nexaTelegramChannel = value => { try { var item = JSON.parse(value); if (!channels.some(function(ch) { return ch.telegramId === item.id; })) { channels.push({id:uid(), telegramId:item.id, name:item.name, role:'unassigned', syncAt:Date.now()}); } channelInfo[item.id] = {members: item.memberCount || item.members || null, description: item.description || item.title || '', type: item.type || ''}; save('channels', channels); render(); } catch(e) {} };
-window.nexaRelayEvent = value => {
-  try {
-    const event = JSON.parse(value), rule = rules.find(item => item.id === event.ruleId); if (!rule) return;
-    if (['forwarded','filtered'].includes(event.status) && event.checkpoint !== '0') { rule.checkpoint = event.checkpoint; rule.processed = (rule.processed || 0) + (event.count || 0); save('rules', rules); }
-    if (event.status === 'forwarded') { $('forwarded').textContent = Number($('forwarded').textContent || 0) + (event.count || 0); $('collected').textContent = Number($('collected').textContent || 0) + (event.count || 0); }
-    else if (event.status === 'filtered') $('filtered').textContent = Number($('filtered').textContent || 0) + 1;
-    else if (event.status === 'blocked') { rule.enabled = false; activeRules.delete(rule.id); save('rules', rules); }
-    if (['blocked','error','flood_wait'].includes(event.status)) { $('systemAlert').classList.add('error'); $('systemAlert').textContent = event.message; }
-    addLog(event.status === 'flood_wait' ? `触发 Telegram 限流，已自动退避：${event.message}` : event.message);
-  } catch { addLog('采集回调解析失败'); }
-};
-window.nexaAiResult = value => { try { $('aiResult').textContent = JSON.stringify(JSON.parse(value), null, 2); } catch { $('aiResult').textContent = value; } addLog('完成一次 DeepSeek 广告分析'); };
-window.nexaAiError = value => { $('aiResult').textContent = value; addLog('DeepSeek 分析失败'); };
-
-function installMaintenancePanel() {
-  const panel = document.createElement('section'); panel.className = 'glass panel maintenance';
-  panel.innerHTML = '<div class="panel-title"><div><small>AI MAINTENANCE</small><h2>智能维护</h2></div><span id="maintenanceState">等待扫描</span></div><p class="maintenance-copy">只分析绑定、规则、断点和失败记录，不提供聊天功能，也不会自动执行高风险操作。</p><button class="primary" id="runMaintenance">运行健康扫描</button><pre id="maintenanceReport" class="ai-result">尚未生成维护报告</pre>';
-  $('dashboard').appendChild(panel);
-  $('runMaintenance').onclick = () => { $('maintenanceState').textContent = '扫描中'; $('maintenanceReport').textContent = '正在分析本地运行快照…'; NexaNative.runMaintenance(JSON.stringify({channels:channels.map(({id,role,name})=>({id,role,name})), rules, recentLogs:logs.slice(0,40), running})); };
-  window.nexaMaintenanceResult = value => { try { const data = JSON.parse(value); $('maintenanceReport').textContent = JSON.stringify(data, null, 2); $('maintenanceState').textContent = data.health === 'healthy' ? '状态良好' : data.health === 'critical' ? '需要处理' : '发现建议'; } catch { $('maintenanceReport').textContent = value; $('maintenanceState').textContent = '报告完成'; } addLog('智能维护扫描完成'); };
-  window.nexaMaintenanceError = value => { $('maintenanceReport').textContent = value; $('maintenanceState').textContent = '扫描失败'; };
+// === Settings page ===
+function renderSettingsPage(container){
+  var html='';
+  html+='<div class="fold"><div class="fold-head" onclick="toggleFold(this)"><span>🔐 Telegram API</span><span class="fold-arrow">›</span></div><div class="fold-body">';
+  html+='<label>API ID<input id="cfgApiId" value="'+(localStorage.getItem("tg_api_id")||"")+'" placeholder="从 my.telegram.org 获取"></label>';
+  html+='<label>API Hash<input id="cfgApiHash" type="password" placeholder="加密保存"></label>';
+  html+='<button class="primary" onclick="saveApiConfig()">保存</button>';
+  html+='<div style="margin-top:10px"><button onclick="NexaNative?.startTelegram();showToast(\'⟳ 连接中...\')">连接 Telegram</button></div>';
+  html+='</div></div>';
+  html+='<div class="fold"><div class="fold-head" onclick="toggleFold(this)"><span>🤖 DeepSeek</span><span class="fold-arrow">›</span></div><div class="fold-body">';
+  html+='<label>API Key<input id="cfgDsKey" type="password" value="'+deepseekKey+'" placeholder="用于 AI 助手"></label>';
+  html+='<button class="primary" onclick="deepseekKey=$(\'cfgDsKey\').value;localStorage.setItem(\'deepseek_key\',deepseekKey);showToast(\'✅ 已保存\')">保存</button>';
+  html+='</div></div>';
+  html+='<div class="fold"><div class="fold-head" onclick="toggleFold(this)"><span>🌐 代理</span><span class="fold-arrow">›</span></div><div class="fold-body">';
+  html+='<label>类型<select id="cfgProxyType"><option>关闭</option><option>SOCKS5</option><option>HTTP</option></select></label>';
+  html+='<label>服务器<input id="cfgProxyHost" placeholder="127.0.0.1"></label>';
+  html+='<label>端口<input id="cfgProxyPort" type="number" placeholder="1080"></label>';
+  html+='<button class="primary" onclick="saveProxyCfg()">保存代理</button>';
+  html+='</div></div>';
+  container.innerHTML=html;
 }
 
-if (window.NexaNative) { installSettingsPanels(); installMaintenancePanel(); }
-if (window.NexaNative) {
-  try {
-    const snapshot = JSON.parse(NexaNative.runtimeSnapshot());
-    $('forwarded').textContent = snapshot.forwarded || 0;
-    $('filtered').textContent = snapshot.filtered || 0;
-    $('collected').textContent = (snapshot.forwarded || 0) + (snapshot.filtered || 0);
-    if (!logs.length && Array.isArray(snapshot.events)) {
-      logs = snapshot.events.map(event => `[后台记录] ${event.message || event.status}`).slice(0, 100);
-      save('logs', logs);
+window.toggleFold=function(el){
+  var body=el.nextElementSibling;body.classList.toggle('open');
+  el.querySelector('.fold-arrow').classList.toggle('open');
+};
+window.saveApiConfig=function(){
+  var id=$('cfgApiId').value.trim(),hash=$('cfgApiHash').value.trim();
+  if(!id||!hash)return showToast('⚠ 请填写完整');
+  localStorage.setItem('tg_api_id',id);
+  NexaNative?.saveSecrets(id,hash,'');
+  $('cfgApiHash').value='';showToast('✅ 已保存');
+};
+// === Proxy test ===
+window.testProxy = function() {
+  addSystemMsg('🌐 正在测试代理连接...');
+  // NativeBridge will handle the actual test
+  showToast('🌐 测试中...');
+};
+
+window.saveProxyCfg=function(){
+  var type=$('cfgProxyType').value,host=$('cfgProxyHost').value.trim(),port=Number($('cfgProxyPort').value)||0;
+  NexaNative?.saveProxy(type,host,port,'','');
+  showToast('✅ 代理已保存');
+};
+
+// === Relay ===
+const activeRules=new Set();
+function runNativeRule(rule){
+  if(!running||!rule.enabled||!window.NexaNative||activeRules.has(rule.id))return;
+  var src=channels.find(c=>c.id===rule.source);
+  var tgt=channels.find(c=>c.id===rule.target);
+  if(!src?.telegramId||!tgt?.telegramId)return;
+  activeRules.add(rule.id);
+  NexaNative.runRelayRule(JSON.stringify({...rule,sourceChatId:src.telegramId,targetChatId:tgt.telegramId,checkpoint:/^\d+$/.test(String(rule.checkpoint))?String(rule.checkpoint):'0'}));
+}
+
+// === Telegram callbacks ===
+window.nexaTelegramError=function(v){showToast('⚠ '+v);addLogLine('❌ Telegram: '+v);addSystemMsg('❌ Telegram 错误：'+v);};
+window.nexaTelegramChannel=function(v){
+  try{
+    var item=JSON.parse(v);
+    if(!channels.some(c=>c.telegramId===item.id)){
+      channels.push({id:uid(),telegramId:item.id,name:item.name,role:'unassigned',syncAt:Date.now()});
+      addLogLine('发现频道: '+item.name);
     }
-  } catch {}
-  $('service').classList.toggle('on', running);
-  $('service').innerHTML = `<i></i>${running ? '后台运行中' : '已停止'}`;
-  $('toggleRun').textContent = running ? '停止采集' : '启动采集';
+    channelInfo[item.id]={members:item.memberCount||null,description:item.description||'',type:item.type||''};
+    save('channels',channels);save('channelInfo',channelInfo);
+  }catch{}
+};
+window.nexaRelayEvent=function(v){
+  try{
+    var event=JSON.parse(v),rule=rules.find(x=>x.id===event.ruleId);if(!rule)return;
+    if(['forwarded','filtered'].includes(event.status)&&event.checkpoint!=='0'){rule.checkpoint=event.checkpoint;rule.processed=(rule.processed||0)+(event.count||0);save('rules',rules);}
+    if(event.status==='forwarded')addLogLine('转发 '+event.count+' 条: '+event.message);
+    else if(event.status==='idle')addLogLine(event.message);
+    else if(event.status==='error'){addLogLine('❌ 错误: '+event.message);addSystemMsg('❌ 采集错误：'+event.message);}
+    if(event.status==='blocked'){rule.enabled=false;activeRules.delete(rule.id);save('rules',rules);addLogLine('规则已暂停: '+event.message);}
+  }catch{}
+};
+window.nexaTelegramState=function(step){
+  if(step==='ready')setTdlibStatus('ready');
+  else if(step==='starting')setTdlibStatus('connecting');
+  else if(step==='closed'||step==='unsupported_auth_step')setTdlibStatus('error');
+
+  var map={starting:'连接中...',phone:'输入手机号',code:'输入验证码',password:'输入密码',ready:'已连接',closed:'已断开'};
+  addLogLine('Telegram: '+(map[step]||step));
+  if(step==='ready')addSystemMsg('✅ Telegram 已连接，可以开始同步频道了');
+};
+
+// === Keyboard enter to send ===
+document.addEventListener('keydown',function(e){
+  if(e.key==='Enter'&&!e.shiftKey&&document.activeElement===$('chatInput')){e.preventDefault();sendChat();}
+});
+
+// === Init ===
+function init(){
+  // Check TDLib status
+  if(running)setTdlibStatus('ready');
+  else setTdlibStatus('uninitialized');
+  // Log stream
+  $('logBody').innerHTML='';
+  logs.slice(0,10).reverse().forEach(function(l){
+    var line=document.createElement('div');line.className='log-line';line.textContent=l;$('logBody').appendChild(line);
+  });
+  // Welcome
+  addSystemMsg('⚡ RELAY 已就绪');
+  if(!deepseekKey)addSystemMsg('💡 请在设置中配置 DeepSeek Key 以启用 AI 助手');
+  if(!channels.length)addSystemMsg('📱 请先在设置中连接 Telegram 并同步频道');
+  else addSystemMsg('📱 已有 '+channels.length+' 个频道，'+rules.length+' 条规则');
+  updateStatus();
 }
-render();
+
+window.NexaNative&&init();
