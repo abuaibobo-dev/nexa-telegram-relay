@@ -444,8 +444,8 @@ final class NativeBridge {
         if (linkCount > 2) return true;
         
         // Rule 2: WeChat/QQ contact patterns
-        if (lower.matches(".*(@|wechat|微信|wx)[\s]*[a-zA-Z0-9_]{5,}.*")) return true;
-        if (lower.matches(".*qq[\s:：]*[0-9]{5,}.*")) return true;
+        if (lower.matches(".*(@|wechat|微信|wx)[\\s]*[a-zA-Z0-9_]{5,}.*")) return true;
+        if (lower.matches(".*qq[\\s:：]*[0-9]{5,}.*")) return true;
         
         // Rule 3: Short link domains
         String[] shortDomains = {"bit.ly", "t.me", "wa.me", "tinyurl.com", "dwz.cn", 
