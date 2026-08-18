@@ -19,6 +19,8 @@ function setTdlibStatus(s) {
     send.disabled = true; send.style.opacity = '0.4';
   }
   updateStatus();
+  var adCount = window.NexaNative?.getAdBlockedCount() || 0;
+  if (adCount > 0) addSystemMsg('🛡️ 已拦截 '+adCount+' 条广告');
 }
 
 // === Message Queue ===
@@ -76,6 +78,17 @@ const HELP_TEXT = [
   '  "启动采集"',
   '  "看看现在采了多少"',
 ].join('\n');
+
+window.saveAdConfig = function() {
+  adKeywords = $('cfgAdKw').value.split(',').map(s=>s.trim()).filter(Boolean);
+  save('ad_keywords', adKeywords);
+  showToast('✅ 广告检测已更新');
+};
+window.saveDiscoveryConfig = function() {
+  discoveryFrequency = $('cfgDiscoveryFreq').value;
+  localStorage.setItem('discovery_frequency', discoveryFrequency);
+  showToast('✅ 已保存');
+};
 
 function processQueue() {
   if (msgProcessing || !msgQueue.length) return;
@@ -459,8 +472,53 @@ window.saveApiConfig=function(){
 // === Proxy test ===
 window.testProxy = function() {
   addSystemMsg('🌐 正在测试代理连接...');
-  // NativeBridge will handle the actual test
   showToast('🌐 测试中...');
+};
+
+// === Ad detection ===
+let adDetectionEnabled = localStorage.getItem('ad_detection') !== 'false';
+let adKeywords = read('ad_keywords', ['加微信','加我','联系客服','限时优惠','赚钱','日入','免费领','扫码','推广','代理','兼职','刷单','优惠券','折扣','秒杀','拼团','薅羊毛','引流','变现','带货','加盟','投资','理财','贷款']);
+
+// === Channel discovery ===
+let candidateChannels = read('candidate_channels', []);
+let discoveryEnabled = localStorage.getItem('discovery_enabled') === 'true';
+let discoveryFrequency = localStorage.getItem('discovery_frequency') || 'manual';
+
+window.runDiscovery = function() {
+  if (!window.NexaNative) return showToast('⚠ 不可用');
+  addSystemMsg('🔍 正在搜索相似频道...');
+  showToast('🔍 搜索中...');
+  NexaNative.discoverChannels(JSON.stringify({maxResults: 10}));
+};
+
+window.nexaDiscoverResult = function(v) {
+  try {
+    var data = JSON.parse(v);
+    if (data.error) { addSystemMsg('❌ ' + data.error); return; }
+    var channels = data.channels || [];
+    if (!channels.length) { addSystemMsg('🔍 未发现新频道'); return; }
+    candidateChannels = channels;
+    save('candidate_channels', candidateChannels);
+    addSystemMsg('🔍 发现 ' + channels.length + ' 个相似频道');
+    // Show in chat
+    var list = channels.map(function(c, i) {
+      return (i+1) + '. ' + c.name + (c.members ? ' (' + c.members + ' 成员)' : '');
+    }).join('\n');
+    addMsg('ai', '📋 发现的候选频道：\n' + list + '\n\n说"添加第X个"即可添加为来源');
+  } catch(e) { addSystemMsg('❌ 解析失败'); }
+};
+
+window.addCandidate = function(idx) {
+  var ch = candidateChannels[idx];
+  if (!ch) return;
+  channels.push({id: uid(), telegramId: ch.id, name: ch.name, role: 'source', syncAt: Date.now()});
+  channelInfo[ch.id] = {members: ch.members, description: ''};
+  save('channels', channels);
+  save('channelInfo', channelInfo);
+  candidateChannels.splice(idx, 1);
+  save('candidate_channels', candidateChannels);
+  showToast('✅ 已添加为来源');
+  addSystemMsg('✅ ' + ch.name + ' 已添加为来源频道');
 };
 
 window.saveProxyCfg=function(){
@@ -481,7 +539,7 @@ function runNativeRule(rule){
 }
 
 // === Telegram callbacks ===
-window.nexaTelegramError=function(v){showToast('⚠ '+v);addLogLine('❌ Telegram: '+v);addSystemMsg('❌ Telegram 错误：'+v);};
+window.nexaTelegramError=function(v){showToast('⚠ '+v);addLogLine('❌ Telegram: '+v);if(v&&v.length>2)addSystemMsg('❌ '+v);};
 window.nexaTelegramChannel=function(v){
   try{
     var item=JSON.parse(v);

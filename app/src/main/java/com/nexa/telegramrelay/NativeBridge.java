@@ -41,6 +41,7 @@ final class NativeBridge {
     private final ScheduledExecutorService relayScheduler = Executors.newSingleThreadScheduledExecutor();
     private final ConcurrentHashMap<String, String> activeRules = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Integer> failureCounts = new ConcurrentHashMap<>();
+    private volatile int adBlockedCount = 0;
     private volatile Client telegram;
 
     private volatile boolean restoreWhenReady;
@@ -88,14 +89,22 @@ final class NativeBridge {
 
     @JavascriptInterface public boolean startTelegram() {
         try {
-            if (store.get("telegram_api_id").isEmpty() || store.get("telegram_api_hash").isEmpty()) return false;
+            String apiId = store.get("telegram_api_id");
+            String apiHash = store.get("telegram_api_hash");
+            if (apiId.isEmpty() || apiHash.isEmpty()) {
+                telegramError("请先在设置中保存 Telegram API ID 和 API Hash");
+                return false;
+            }
             if (telegram == null) {
                 telegram = Client.create(this::onTelegramUpdate, error -> telegramError(error.getMessage()), error -> telegramError(error.getMessage()));
                 applySavedProxy();
             }
             callback("nexaTelegramState", "starting");
             return true;
-        } catch (Exception error) { telegramError(error.getMessage()); return false; }
+        } catch (Exception error) {
+            telegramError("启动失败：" + error.getMessage());
+            return false;
+        }
     }
 
     @JavascriptInterface public void submitTelegramPhone(String phone) {
@@ -159,6 +168,78 @@ final class NativeBridge {
         if (ruleId != null) { activeRules.remove(ruleId); persistActiveRules(); }
     }
 
+
+    // === Channel discovery ===
+    @JavascriptInterface public void discoverChannels(String ruleJson) {
+        if (telegram == null) { telegramError("请先登录 Telegram"); return; }
+        try {
+            JSONObject rule = new JSONObject(ruleJson);
+            int maxResults = rule.optInt("maxResults", 10);
+            
+            // Get all source channel IDs
+            java.util.List<Long> sourceIds = new java.util.ArrayList<>();
+            for (int i = 0; i < channels.length(); i++) {
+                JSONObject ch = channels.getJSONObject(i);
+                if ("source".equals(ch.optString("role"))) {
+                    sourceIds.add(ch.getLong("telegramId"));
+                }
+            }
+            
+            if (sourceIds.isEmpty()) {
+                callback("nexaDiscoverResult", "{"channels":[],"error":"没有来源频道，请先添加"}");
+                return;
+            }
+            
+            java.util.Set<Long> discovered = new java.util.HashSet<>();
+            java.util.List<JSONObject> results = new java.util.ArrayList<>();
+            
+            // Query recommendations for each source channel
+            for (long sourceId : sourceIds) {
+                telegram.send(new TdApi.GetChatRecommendations(sourceId), object -> {
+                    if (object instanceof TdApi.Chats) {
+                        long[] chatIds = ((TdApi.Chats) object).chatIds;
+                        for (long chatId : chatIds) {
+                            if (discovered.size() >= maxResults) break;
+                            if (discovered.contains(chatId)) continue;
+                            
+                            // Check if already in our channel list
+                            boolean exists = false;
+                            for (int j = 0; j < channels.length(); j++) {
+                                if (channels.getJSONObject(j).optLong("telegramId") == chatId) {
+                                    exists = true; break;
+                                }
+                            }
+                            if (exists) continue;
+                            
+                            discovered.add(chatId);
+                            // Get chat info
+                            telegram.send(new TdApi.GetChat(chatId), chatObj -> {
+                                if (chatObj instanceof TdApi.Chat) {
+                                    TdApi.Chat chat = (TdApi.Chat) chatObj;
+                                    try {
+                                        JSONObject info = new JSONObject();
+                                        info.put("id", chatId);
+                                        info.put("name", chat.title != null ? chat.title : "未知");
+                                        info.put("members", chat.memberCount);
+                                        info.put("source", sourceId);
+                                        info.put("discoveredAt", System.currentTimeMillis());
+                                        results.add(info);
+                                        
+                                        if (results.size() >= maxResults || results.size() == discovered.size()) {
+                                            callback("nexaDiscoverResult", 
+                                                new JSONObject().put("channels", new org.json.JSONArray(results)).toString());
+                                        }
+                                    } catch (Exception ignored) {}
+                                }
+                            });
+                        }
+                    }
+                });
+            }
+        } catch (Exception error) {
+            callback("nexaDiscoverResult", "{"channels":[],"error":"" + error.getMessage() + ""}");
+        }
+    }
     private void executeRelayRule(String ruleJson) {
         try { activeRules.remove(new JSONObject(ruleJson).getString("id")); }
         catch (Exception ignored) { return; }
@@ -279,7 +360,14 @@ final class NativeBridge {
                     || "仅视频".equals(type) && video
                     || "完整媒体组".equals(type) && message.mediaAlbumId != 0;
             if ("整组跳过".equals(albumMode) && message.mediaAlbumId != 0) accepted = false;
-            if (accepted && keywordMatches(message, keywords) && message.canBeSaved) selected.add(message.id);
+            if (accepted && keywordMatches(message, keywords) && message.canBeSaved) {
+            if (isAdvertisement(message)) {
+                adBlockedCount++;
+                callback("nexaRelayEvent", relayEvent(rule.optString("id"), "ad_blocked", 0, 0, "广告拦截: " + message.id));
+            } else {
+                selected.add(message.id);
+            }
+        }
         }
         if ("整组保留".equals(albumMode) && !selected.isEmpty()) {
             java.util.Set<Long> selectedAlbums = new java.util.HashSet<>();
@@ -320,6 +408,66 @@ final class NativeBridge {
         });
     }
 
+
+    // === Ad detection rule engine ===
+    private boolean isAdvertisement(TdApi.Message message) {
+        String text = "";
+        int linkCount = 0;
+        
+        // Extract text and count links
+        if (message.content instanceof TdApi.MessageText) {
+            TdApi.MessageText mt = (TdApi.MessageText) message.content;
+            text = mt.text.text;
+            linkCount = mt.text.entities != null ? 
+                (int) java.util.Arrays.stream(mt.text.entities)
+                    .filter(e -> e.type instanceof TdApi.TextEntityTypeUrl || 
+                                 e.type instanceof TdApi.TextEntityTypeTextUrl)
+                    .count() : 0;
+        } else if (message.content instanceof TdApi.MessagePhoto) {
+            text = ((TdApi.MessagePhoto) message.content).caption.text;
+        } else if (message.content instanceof TdApi.MessageVideo) {
+            text = ((TdApi.MessageVideo) message.content).caption.text;
+        } else if (message.content instanceof TdApi.MessageDocument) {
+            text = ((TdApi.MessageDocument) message.content).caption.text;
+        } else if (message.content instanceof TdApi.MessageAnimation) {
+            text = ((TdApi.MessageAnimation) message.content).caption.text;
+        } else if (message.content instanceof TdApi.MessageAudio) {
+            text = ((TdApi.MessageAudio) message.content).caption.text;
+        } else if (message.content instanceof TdApi.MessageVoiceNote) {
+            text = ((TdApi.MessageVoiceNote) message.content).caption.text;
+        }
+        
+        if (text.isEmpty()) return false;
+        String lower = text.toLowerCase();
+        
+        // Rule 1: Too many links (>2)
+        if (linkCount > 2) return true;
+        
+        // Rule 2: WeChat/QQ contact patterns
+        if (lower.matches(".*(@|wechat|微信|wx)[\s]*[a-zA-Z0-9_]{5,}.*")) return true;
+        if (lower.matches(".*qq[\s:：]*[0-9]{5,}.*")) return true;
+        
+        // Rule 3: Short link domains
+        String[] shortDomains = {"bit.ly", "t.me", "wa.me", "tinyurl.com", "dwz.cn", 
+                                  "suo.im", "url.cn", "t.cn", "is.gd", "v.gd"};
+        for (String domain : shortDomains) {
+            if (lower.contains(domain)) return true;
+        }
+        
+        // Rule 4: Ad keywords
+        String[] adKeywords = {"加微信", "加我", "联系客服", "限时优惠", "赚钱", "日入",
+                               "免费领", "扫码", "推广", "代理", "兼职", "刷单",
+                               "优惠券", "折扣", "秒杀", "拼团", "薅羊毛", "引流",
+                               "变现", "带货", "加盟", "投资", "理财", "贷款"};
+        for (String kw : adKeywords) {
+            if (lower.contains(kw)) return true;
+        }
+        
+        // Rule 5: Forwarded message with links (suspicious)
+        if (message.forwardOrigin != null && linkCount > 0) return true;
+        
+        return false;
+    }
     private boolean keywordMatches(TdApi.Message message, String keywords) {
         if (keywords.trim().isEmpty()) return true;
         String text = "";
@@ -344,6 +492,8 @@ final class NativeBridge {
                 || upper.contains("CHAT_ADMIN_REQUIRED") ? "blocked" : "error";
         callback("nexaRelayEvent", relayEvent(ruleId, status, 0, 0, message));
     }
+
+    @JavascriptInterface public int getAdBlockedCount() { return adBlockedCount; }
 
     @JavascriptInterface public String runtimeSnapshot() {
         try {
@@ -381,7 +531,9 @@ final class NativeBridge {
         if (!(object instanceof TdApi.UpdateAuthorizationState)) return;
         TdApi.AuthorizationState state = ((TdApi.UpdateAuthorizationState) object).authorizationState;
         try {
+            String stateName = state.getClass().getSimpleName();
             if (state instanceof TdApi.AuthorizationStateWaitTdlibParameters) {
+                callback("nexaTelegramError", "正在初始化 TDLib...");
                 String database = new java.io.File(context.getFilesDir(), "tdlib/database").getAbsolutePath();
                 String files = new java.io.File(context.getFilesDir(), "tdlib/files").getAbsolutePath();
                 new java.io.File(database).mkdirs(); new java.io.File(files).mkdirs();
@@ -408,7 +560,20 @@ final class NativeBridge {
     }
 
     private void handleTelegramResult(TdApi.Object object) {
-        if (object instanceof TdApi.Error) telegramError(((TdApi.Error) object).message);
+        if (object instanceof TdApi.Error) {
+            TdApi.Error err = (TdApi.Error) object;
+            String msg = err.message != null ? err.message : "未知错误";
+            // Map common errors to user-friendly messages
+            if (msg.contains("PHONE_NUMBER_INVALID")) msg = "手机号格式不正确";
+            else if (msg.contains("PHONE_CODE_INVALID")) msg = "验证码不正确";
+            else if (msg.contains("PHONE_CODE_EXPIRED")) msg = "验证码已过期，请重新获取";
+            else if (msg.contains("PASSWORD_HASH_INVALID")) msg = "二次密码不正确";
+            else if (msg.contains("API_ID_INVALID") || msg.contains("API_HASH_INVALID")) msg = "API ID 或 Hash 不正确，请检查设置";
+            else if (msg.contains("FLOOD")) msg = "请求过于频繁，请稍后再试";
+            else if (msg.contains("PHONE_NUMBER_BANNED")) msg = "该手机号已被 Telegram 封禁";
+            else if (msg.contains("USER_DEACTIVATED")) msg = "该账号已被停用";
+            telegramError(msg);
+        }
     }
 
     private void emitChannel(TdApi.Object object) {
@@ -425,7 +590,11 @@ final class NativeBridge {
         try {
             store.put("telegram_api_id", apiId.trim());
             store.put("telegram_api_hash", apiHash.trim());
-            store.put("deepseek_api_key", deepSeekKey.trim());
+            if (deepSeekKey != null && !deepSeekKey.trim().isEmpty()) {
+                store.put("deepseek_api_key", deepSeekKey.trim());
+            }
+            // Save plaintext backup for API ID (not secret, needed for quick check)
+            preferences.edit().putString("api_id_plaintext", apiId.trim()).apply();
             return true;
         } catch (Exception error) { return false; }
     }
