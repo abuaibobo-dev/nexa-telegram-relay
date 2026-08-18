@@ -1,0 +1,37 @@
+plugins { id 'com.android.application' }
+
+dependencies {
+    implementation 'androidx.annotation:annotation:1.9.1'
+}
+
+android {
+    namespace 'com.nexa.telegramrelay'
+    compileSdk 35
+    buildToolsVersion '35.0.0'
+
+    defaultConfig {
+        applicationId 'com.nexa.telegramrelay'
+        minSdk 26
+        targetSdk 35
+        versionCode 11
+        versionName '1.1.0'
+    }
+
+    signingConfigs {
+        debug {
+            storeFile file('nexa-debug.keystore')
+            storePassword 'android'
+            keyAlias 'androiddebugkey'
+            keyPassword 'android'
+        }
+    }
+
+    buildTypes {
+        debug { signingConfig signingConfigs.debug }
+        release {
+            signingConfig signingConfigs.debug
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+}

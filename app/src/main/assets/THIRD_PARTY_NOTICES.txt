@@ -1,0 +1,9 @@
+TDLib
+Copyright Aliaksei Levin, Arseny Smirnov and other contributors.
+Licensed under the Boost Software License 1.0.
+Source: https://github.com/tdlib/td
+
+The Android native TDLib 1.8.66 binaries used for this personal test build were
+obtained from the open-source MonoGram Libre universal release 0.3.1, whose
+official build uses the upstream tdlib/td source.
+Build provenance: https://github.com/monogram-android/monogram/releases/tag/0.3.1
