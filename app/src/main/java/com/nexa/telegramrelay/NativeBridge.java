@@ -170,76 +170,67 @@ final class NativeBridge {
 
 
     // === Channel discovery ===
-    @JavascriptInterface public void discoverChannels(String ruleJson) {
+    @JavascriptInterface public void discoverChannels(String sourceIdsJson) {
         if (telegram == null) { telegramError("请先登录 Telegram"); return; }
         try {
-            JSONObject rule = new JSONObject(ruleJson);
-            int maxResults = rule.optInt("maxResults", 10);
-            
-            // Get all source channel IDs
+            org.json.JSONArray idsArr = new org.json.JSONArray(sourceIdsJson);
             java.util.List<Long> sourceIds = new java.util.ArrayList<>();
-            for (int i = 0; i < channels.length(); i++) {
-                JSONObject ch = channels.getJSONObject(i);
-                if ("source".equals(ch.optString("role"))) {
-                    sourceIds.add(ch.getLong("telegramId"));
-                }
+            for (int i = 0; i < idsArr.length(); i++) {
+                sourceIds.add(idsArr.getLong(i));
             }
-            
             if (sourceIds.isEmpty()) {
                 callback("nexaDiscoverResult", "{\"channels\":[],\"error\":\"没有来源频道，请先添加\"}");
                 return;
             }
-            
             java.util.Set<Long> discovered = new java.util.HashSet<>();
             java.util.List<JSONObject> results = new java.util.ArrayList<>();
-            
-            // Query recommendations for each source channel
+            final int[] pending = {sourceIds.size()};
             for (long sourceId : sourceIds) {
                 telegram.send(new TdApi.GetChatRecommendations(sourceId), object -> {
                     if (object instanceof TdApi.Chats) {
                         long[] chatIds = ((TdApi.Chats) object).chatIds;
                         for (long chatId : chatIds) {
-                            if (discovered.size() >= maxResults) break;
+                            if (discovered.size() >= 10) break;
                             if (discovered.contains(chatId)) continue;
-                            
-                            // Check if already in our channel list
-                            boolean exists = false;
-                            for (int j = 0; j < channels.length(); j++) {
-                                if (channels.getJSONObject(j).optLong("telegramId") == chatId) {
-                                    exists = true; break;
-                                }
-                            }
-                            if (exists) continue;
-                            
                             discovered.add(chatId);
-                            // Get chat info
                             telegram.send(new TdApi.GetChat(chatId), chatObj -> {
                                 if (chatObj instanceof TdApi.Chat) {
                                     TdApi.Chat chat = (TdApi.Chat) chatObj;
                                     try {
                                         JSONObject info = new JSONObject();
                                         info.put("id", chatId);
-                                        info.put("name", chat.title != null ? chat.title : "未知");
+                                        info.put("name", chat.title != null ? chat.title : "unknown");
                                         info.put("members", chat.memberCount);
                                         info.put("source", sourceId);
-                                        info.put("discoveredAt", System.currentTimeMillis());
                                         results.add(info);
-                                        
-                                        if (results.size() >= maxResults || results.size() == discovered.size()) {
-                                            callback("nexaDiscoverResult", 
-                                                new JSONObject().put("channels", new org.json.JSONArray(results)).toString());
-                                        }
+                                    } catch (Exception ignored) {}
+                                }
+                                pending[0]--;
+                                if (pending[0] <= 0) {
+                                    try {
+                                        callback("nexaDiscoverResult",
+                                            new JSONObject().put("channels", new org.json.JSONArray(results)).toString());
                                     } catch (Exception ignored) {}
                                 }
                             });
+                        }
+                    } else {
+                        pending[0]--;
+                        if (pending[0] <= 0) {
+                            try {
+                                callback("nexaDiscoverResult",
+                                    new JSONObject().put("channels", new org.json.JSONArray(results)).toString());
+                            } catch (Exception ignored) {}
                         }
                     }
                 });
             }
         } catch (Exception error) {
-            callback("nexaDiscoverResult", "{\"channels\":[],\"error\":\"" + error.getMessage() + "\"}");
+            try {
+                callback("nexaDiscoverResult",
+                    new JSONObject().put("channels", new org.json.JSONArray()).put("error", error.getMessage()).toString());
+            } catch (Exception ignored) {}
         }
-    }
     private void executeRelayRule(String ruleJson) {
         try { activeRules.remove(new JSONObject(ruleJson).getString("id")); }
         catch (Exception ignored) { return; }
