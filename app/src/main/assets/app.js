@@ -299,7 +299,7 @@ function executeAction(action){
 async function sendChat(){
   var input=$('chatInput');
   var text=input.value.trim();if(!text)return;
-  input.value='';autoResize(input);
+  input.value='';autoResize(input);$('sendBtn')?.classList.remove('has-text');
   addMsg('user',esc(text));
   chatHistory.push({role:'user',content:text});
   // Try local command first (works offline)
@@ -328,7 +328,10 @@ function sendQuickCmd(cmd){
 // === Auto resize textarea ===
 function autoResize(el){
   el.style.height='auto';
-  el.style.height=Math.min(el.scrollHeight,100)+'px';
+  el.style.height=Math.min(el.scrollHeight,120)+'px';
+  // Highlight send button
+  var btn=$('sendBtn');
+  if(btn)btn.classList.toggle('has-text',el.value.trim().length>0);
 }
 
 // === Status update ===
@@ -488,7 +491,7 @@ window.runDiscovery = function() {
   if (!window.NexaNative) return showToast('⚠ 不可用');
   addSystemMsg('🔍 正在搜索相似频道...');
   showToast('🔍 搜索中...');
-  NexaNative.discoverChannels(JSON.stringify({maxResults: 10}));
+  var srcIds=channels.filter(function(c){return c.role==='source'}).map(function(c){return c.telegramId});NexaNative.discoverChannels(JSON.stringify(srcIds));
 };
 
 window.nexaDiscoverResult = function(v) {

@@ -464,7 +464,7 @@ final class NativeBridge {
         }
         
         // Rule 5: Forwarded message with links (suspicious)
-        if (message.forwardOrigin != null && linkCount > 0) return true;
+        if (message.forwardInfo != null && linkCount > 0) return true;
         
         return false;
     }
@@ -594,7 +594,7 @@ final class NativeBridge {
                 store.put("deepseek_api_key", deepSeekKey.trim());
             }
             // Save plaintext backup for API ID (not secret, needed for quick check)
-            preferences.edit().putString("api_id_plaintext", apiId.trim()).apply();
+            store.put("api_id_plaintext", apiId.trim());
             return true;
         } catch (Exception error) { return false; }
     }
