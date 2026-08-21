@@ -1,12 +1,16 @@
 name: Build APK
+
 on:
   push:
     branches: [master]
+    tags: ['v*']
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -15,8 +19,24 @@ jobs:
           java-version: 17
       - uses: gradle/actions/setup-gradle@v4
       - run: gradle wrapper
-      - run: ./gradlew assembleDebug
+      - run: ./gradlew assembleRelease
+      - name: Prepare APK
+        run: |
+          mkdir -p dist
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then TAG="$GITHUB_REF_NAME"; else TAG="master-${GITHUB_SHA::7}"; fi
+          echo "APK_TAG=$TAG" >> "$GITHUB_ENV"
+          cp app/build/outputs/apk/release/app-release.apk "dist/NEXA-Telegram-Relay-$TAG.apk"
       - uses: actions/upload-artifact@v4
         with:
-          name: NEXA-Relay
-          path: app/build/outputs/apk/debug/*.apk
+          name: NEXA-Telegram-Relay-${{ env.APK_TAG }}
+          path: dist/*.apk
+      - name: Create release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$APK_TAG" "dist/NEXA-Telegram-Relay-$APK_TAG.apk" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "NEXA Telegram Relay $APK_TAG" \
+            --notes "Android native TDLib relay" || \
+          gh release upload "$APK_TAG" "dist/NEXA-Telegram-Relay-$APK_TAG.apk" --repo "$GITHUB_REPOSITORY" --clobber

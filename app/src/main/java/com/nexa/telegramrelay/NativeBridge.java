@@ -231,6 +231,8 @@ final class NativeBridge {
                     new JSONObject().put("channels", new org.json.JSONArray()).put("error", error.getMessage()).toString());
             } catch (Exception ignored) {}
         }
+    }
+
     private void executeRelayRule(String ruleJson) {
         try { activeRules.remove(new JSONObject(ruleJson).getString("id")); }
         catch (Exception ignored) { return; }
