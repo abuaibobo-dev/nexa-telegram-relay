@@ -175,66 +175,88 @@ final class NativeBridge {
         try {
             org.json.JSONArray idsArr = new org.json.JSONArray(sourceIdsJson);
             java.util.List<Long> sourceIds = new java.util.ArrayList<>();
-            for (int i = 0; i < idsArr.length(); i++) {
-                sourceIds.add(idsArr.getLong(i));
-            }
+            for (int i = 0; i < idsArr.length(); i++) sourceIds.add(idsArr.getLong(i));
             if (sourceIds.isEmpty()) {
                 callback("nexaDiscoverResult", "{\"channels\":[],\"error\":\"没有来源频道，请先添加\"}");
                 return;
             }
+
             java.util.Set<Long> discovered = new java.util.HashSet<>();
             java.util.List<JSONObject> results = new java.util.ArrayList<>();
-            final int[] pending = {sourceIds.size()};
-            for (long sourceId : sourceIds) {
-                telegram.send(new TdApi.GetChatSimilarChats(sourceId), object -> {
-                    if (object instanceof TdApi.Chats) {
-                        long[] chatIds = ((TdApi.Chats) object).chatIds;
-                        for (long chatId : chatIds) {
-                            if (discovered.size() >= 10) break;
-                            if (discovered.contains(chatId)) continue;
-                            discovered.add(chatId);
-                            telegram.send(new TdApi.GetChat(chatId), chatObj -> {
-                                if (chatObj instanceof TdApi.Chat) {
-                                    TdApi.Chat chat = (TdApi.Chat) chatObj;
-                                    try {
-                                        JSONObject info = new JSONObject();
-                                        info.put("id", chatId);
-                                        info.put("name", chat.title != null ? chat.title : "unknown");
-                                        int members = 0;
-                                        if (chat.type instanceof TdApi.ChatTypeSupergroup) {
-                                            members = ((TdApi.ChatTypeSupergroup) chat.type).memberCount;
-                                        }
-                                        info.put("members", members);
-                                        info.put("source", sourceId);
-                                        results.add(info);
-                                    } catch (Exception ignored) {}
-                                }
-                                pending[0]--;
-                                if (pending[0] <= 0) {
-                                    try {
-                                        callback("nexaDiscoverResult",
-                                            new JSONObject().put("channels", new org.json.JSONArray(results)).toString());
-                                    } catch (Exception ignored) {}
-                                }
-                            });
-                        }
-                    } else {
-                        pending[0]--;
-                        if (pending[0] <= 0) {
-                            try {
-                                callback("nexaDiscoverResult",
-                                    new JSONObject().put("channels", new org.json.JSONArray(results)).toString());
-                            } catch (Exception ignored) {}
-                        }
-                    }
-                });
-            }
+            final int[] sourcesPending = {sourceIds.size()};
+            final int[] lookupsPending = {0};
+            for (long sourceId : sourceIds) discoverSource(sourceId, discovered, results, sourcesPending, lookupsPending);
         } catch (Exception error) {
             try {
                 callback("nexaDiscoverResult",
                     new JSONObject().put("channels", new org.json.JSONArray()).put("error", error.getMessage()).toString());
             } catch (Exception ignored) {}
         }
+    }
+
+    private void discoverSource(
+        long sourceId,
+        java.util.Set<Long> discovered,
+        java.util.List<JSONObject> results,
+        int[] sourcesPending,
+        int[] lookupsPending
+    ) {
+        telegram.send(new TdApi.GetChatSimilarChats(sourceId), object -> {
+            if (object instanceof TdApi.Chats) {
+                int added = 0;
+                for (long chatId : ((TdApi.Chats) object).chatIds) {
+                    if (added >= 10) break;
+                    if (!discovered.add(chatId)) continue;
+                    added++;
+                    lookupsPending[0]++;
+                    telegram.send(new TdApi.GetChat(chatId), chatObj -> {
+                        if (chatObj instanceof TdApi.Chat) {
+                            addDiscoveredChat((TdApi.Chat) chatObj, results, () -> {
+                                lookupsPending[0]--;
+                                finishDiscovery(sourcesPending, lookupsPending, results);
+                            });
+                        } else {
+                            lookupsPending[0]--;
+                            finishDiscovery(sourcesPending, lookupsPending, results);
+                        }
+                    });
+                }
+            }
+            sourcesPending[0]--;
+            finishDiscovery(sourcesPending, lookupsPending, results);
+        });
+    }
+
+    private void addDiscoveredChat(TdApi.Chat chat, java.util.List<JSONObject> results, Runnable complete) {
+        TdApi.ChatType type = chat.type;
+        if (!(type instanceof TdApi.ChatTypeSupergroup)) {
+            appendDiscoveredChat(chat, 0, results);
+            complete.run();
+            return;
+        }
+        long supergroupId = ((TdApi.ChatTypeSupergroup) type).supergroupId;
+        telegram.send(new TdApi.GetSupergroup(supergroupId), object -> {
+            int members = object instanceof TdApi.Supergroup ? ((TdApi.Supergroup) object).memberCount : 0;
+            appendDiscoveredChat(chat, members, results);
+            complete.run();
+        });
+    }
+
+    private void appendDiscoveredChat(TdApi.Chat chat, int members, java.util.List<JSONObject> results) {
+        try {
+            JSONObject info = new JSONObject();
+            info.put("id", chat.id);
+            info.put("name", chat.title != null ? chat.title : "unknown");
+            info.put("members", members);
+            results.add(info);
+        } catch (Exception ignored) {}
+    }
+
+    private void finishDiscovery(int[] sourcesPending, int[] lookupsPending, java.util.List<JSONObject> results) {
+        if (sourcesPending[0] > 0 || lookupsPending[0] > 0) return;
+        try {
+            callback("nexaDiscoverResult", new JSONObject().put("channels", new org.json.JSONArray(results)).toString());
+        } catch (Exception ignored) {}
     }
 
     private void executeRelayRule(String ruleJson) {
