@@ -186,7 +186,7 @@ final class NativeBridge {
             java.util.List<JSONObject> results = new java.util.ArrayList<>();
             final int[] pending = {sourceIds.size()};
             for (long sourceId : sourceIds) {
-                telegram.send(new TdApi.GetChatRecommendations(sourceId), object -> {
+                telegram.send(new TdApi.GetChatSimilarChats(sourceId), object -> {
                     if (object instanceof TdApi.Chats) {
                         long[] chatIds = ((TdApi.Chats) object).chatIds;
                         for (long chatId : chatIds) {
@@ -200,7 +200,11 @@ final class NativeBridge {
                                         JSONObject info = new JSONObject();
                                         info.put("id", chatId);
                                         info.put("name", chat.title != null ? chat.title : "unknown");
-                                        info.put("members", chat.memberCount);
+                                        int members = 0;
+                                        if (chat.type instanceof TdApi.ChatTypeSupergroup) {
+                                            members = ((TdApi.ChatTypeSupergroup) chat.type).memberCount;
+                                        }
+                                        info.put("members", members);
                                         info.put("source", sourceId);
                                         results.add(info);
                                     } catch (Exception ignored) {}
