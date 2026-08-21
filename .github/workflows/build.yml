@@ -19,7 +19,7 @@ jobs:
           java-version: 17
       - uses: gradle/actions/setup-gradle@v4
       - run: gradle wrapper
-      - run: ./gradlew assembleRelease
+      - run: ./gradlew assembleRelease --stacktrace
       - name: Prepare APK
         run: |
           mkdir -p dist
